@@ -205,10 +205,18 @@ class Classifier:
             self.model = None
             self.mock = True
 
+    @staticmethod
+    def _normalise(window: np.ndarray) -> np.ndarray:
+        """Per-window, per-channel z-score — mirrors the training-time normalise()."""
+        mu = window.mean(axis=0, keepdims=True)      # (1, 3)
+        sd = window.std(axis=0, keepdims=True) + 1e-8
+        return (window - mu) / sd
+
     def predict(self, window: np.ndarray) -> Tuple[int, float, List[float]]:
         """window shape: (50, 3).  Returns (class_idx, confidence, all_probs)."""
         if self.model is not None:
-            probs = self.model.predict(window[np.newaxis, ...], verbose=0)[0]
+            norm_window = self._normalise(window)
+            probs = self.model.predict(norm_window[np.newaxis, ...], verbose=0)[0]
             probs = np.asarray(probs, dtype=np.float32)
             return int(np.argmax(probs)), float(np.max(probs)), probs.tolist()
         # ---------- Heuristic fallback (3 classes: curl / squat / rest) ----------
