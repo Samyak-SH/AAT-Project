@@ -70,6 +70,27 @@ export default function LiveCounter({ onSessionChange }: Props) {
 
   const score = state?.form_score ?? 0;
   const pct = Math.round(score * 100);
+  const ex = state?.exercise;
+  const isOther = ex === "other";
+  const isRest = ex === "rest";
+
+  const exerciseLabel = isOther
+    ? "Unknown motion"
+    : ex
+      ? ex[0].toUpperCase() + ex.slice(1)
+      : "—";
+  const exerciseHint = isOther
+    ? "Not a tracked exercise"
+    : isRest
+      ? "Ready"
+      : ex
+        ? "Counting reps"
+        : "";
+  const exerciseColor = isOther
+    ? "text-amber-300"
+    : isRest
+      ? "text-gray-300"
+      : "text-emerald-300";
 
   return (
     <div className="rounded-2xl bg-ink-800 p-6 shadow-xl border border-ink-700">
@@ -90,12 +111,28 @@ export default function LiveCounter({ onSessionChange }: Props) {
       </div>
 
       <div className="grid grid-cols-2 gap-4 mb-6">
-        <div className="rounded-xl bg-ink-700 p-4">
-          <div className="text-sm text-gray-400">Exercise</div>
-          <div className="text-3xl font-semibold capitalize mt-1">
-            {state?.exercise ?? "—"}
+        <div
+          className={
+            "rounded-xl p-4 border transition-colors " +
+            (isOther
+              ? "bg-amber-500/10 border-amber-500/30"
+              : "bg-ink-700 border-transparent")
+          }
+        >
+          <div className="text-sm text-gray-400 flex items-center gap-1.5">
+            Exercise
+            {isOther && (
+              <span className="inline-block text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded-md bg-amber-500/20 text-amber-300">
+                other
+              </span>
+            )}
+          </div>
+          <div className={"text-3xl font-semibold mt-1 " + exerciseColor}>
+            {exerciseLabel}
           </div>
           <div className="text-xs text-gray-400 mt-1">
+            {exerciseHint}
+            {exerciseHint && " · "}
             Confidence: {state ? (state.confidence * 100).toFixed(0) + "%" : "—"}
           </div>
         </div>

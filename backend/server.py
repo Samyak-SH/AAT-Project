@@ -376,7 +376,26 @@ class RepCounter:
                         conn.commit()
 
             form_score = (self.hi_conf / self.total) if self.total else 0.0
+            # When the model predicts "other" (unknown motion), keep showing the
+            # previously-known exercise in the live snapshot. Reps / form still
+            # update, but the UI doesn't flicker to "other".
+            if exercise == "other" and self.last_prediction.get("exercise") not in (None, "other"):
+                display_exercise = self.last_prediction["exercise"]
+                display_confidence = self.last_prediction["confidence"]
+            else:
+                display_exercise = exercise
+                display_confidence = confidence
             self.last_prediction = {
+                "exercise": display_exercise,
+                "confidence": display_confidence,
+                "reps": self.reps,
+                "form_score": form_score,
+                "session_id": self.session_id,
+                "updated_at": now,
+            }
+            # The response to /api/ingest still reports the raw prediction
+            # so the ESP32 Serial Monitor shows what the model actually saw.
+            return {
                 "exercise": exercise,
                 "confidence": confidence,
                 "reps": self.reps,
@@ -384,7 +403,6 @@ class RepCounter:
                 "session_id": self.session_id,
                 "updated_at": now,
             }
-            return dict(self.last_prediction)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:

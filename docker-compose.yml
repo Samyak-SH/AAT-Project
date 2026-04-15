@@ -15,9 +15,11 @@ services:
       # the host at host.docker.internal. Empty string disables Ollama.
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:1b}
-      # Backend falls back to a heuristic classifier if model.h5 isn't present.
-      MODEL_PATH: /models/model.h5
-      DB_PATH: /data/sessions.db
+      # Backend falls back to a heuristic classifier if the model file isn't present.
+      MODEL_PATH: ${MODEL_PATH:-/models/model.h5.best.keras}
+      # MongoDB — set MONGO_URI=mongodb+srv://... in .env to use Atlas.
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      MONGO_DB: ${MONGO_DB:-gym_counter}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

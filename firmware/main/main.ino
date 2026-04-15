@@ -35,7 +35,7 @@ static const int SDA_PIN = 21;
 static const int SCL_PIN = 22;
 
 static const int WINDOW_SIZE  = 50;   // 1s at 50Hz
-static const int WINDOW_STRIDE= 25;   // 0.5s stride
+static const int WINDOW_STRIDE= 50;   // 1s stride → one prediction per second
 static const int SAMPLE_HZ    = 50;
 static const unsigned long SAMPLE_PERIOD_MS = 1000UL / SAMPLE_HZ;
 
