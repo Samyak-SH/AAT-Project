@@ -68,7 +68,46 @@ gym-counter/
 └── README.md
 ```
 
-## Quick start
+## Quick start (Docker — everything in one command)
+
+```bash
+cd gym-counter
+cp .env.example .env        # then edit secrets as needed
+docker compose up --build   # or: make up
+```
+
+Then open:
+
+- Frontend: http://localhost:5173
+- Backend:  http://localhost:8000/api/health
+
+The frontend talks to the backend through an nginx reverse-proxy on the same
+origin, so there are no CORS surprises and the browser doesn't need to know
+the backend URL.
+
+SQLite is persisted in a named volume (`gym-data`). Your host directory
+`backend/` is mounted read-only at `/models` inside the container — drop a
+`model.h5` in there and restart the backend container to switch from heuristic
+mode to the trained CNN:
+
+```bash
+# after training creates backend/model.h5
+docker compose restart backend
+```
+
+Useful Make targets:
+
+| Command          | What it does                                         |
+|------------------|------------------------------------------------------|
+| `make up`        | Build + run backend + frontend (detached)            |
+| `make down`      | Stop containers                                      |
+| `make logs`      | Tail logs from both services                         |
+| `make rebuild`   | Full rebuild + recreate                              |
+| `make train`     | Train a model in a throwaway container (writes `backend/model.h5`) |
+| `LABEL=curl make collect` | Start the data-collection server for a label (port 8000) |
+| `make clean`     | Stop + delete volumes + delete `sessions.db`         |
+
+## Manual (non-Docker) setup
 
 ### 1. Backend
 

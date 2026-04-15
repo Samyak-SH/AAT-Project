@@ -38,12 +38,16 @@ export type SessionListEntry = {
   ended_at: number | null;
 };
 
-const DEFAULT_BASE = "http://localhost:8000";
+// In dev (`vite`), default to the backend on :8000.
+// In prod builds (Docker/nginx), use same-origin so nginx can reverse-proxy /api/.
+const DEFAULT_BASE =
+  (import.meta.env.VITE_API_BASE as string | undefined) ??
+  (import.meta.env.DEV ? "http://localhost:8000" : "");
 
 function getBase(): string {
   try {
     const stored = localStorage.getItem("api_base");
-    if (stored) return stored;
+    if (stored !== null) return stored;
   } catch { /* ignore */ }
   return DEFAULT_BASE;
 }

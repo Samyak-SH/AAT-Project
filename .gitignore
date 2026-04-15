@@ -24,3 +24,4 @@ sessions.db
 # Env
 .env
 .env.*
+!.env.example

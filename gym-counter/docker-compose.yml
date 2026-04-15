@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: gym-counter-backend:latest
+    container_name: gym-counter-backend
+    environment:
+      # Override in a .env file next to this compose file (see .env.example).
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      DEMO_USER: ${DEMO_USER:-admin}
+      DEMO_PASS: ${DEMO_PASS:-admin}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Backend falls back to a heuristic classifier if model.h5 isn't present.
+      MODEL_PATH: /models/model.h5
+      DB_PATH: /data/sessions.db
+    volumes:
+      # Persist SQLite between runs
+      - gym-data:/data
+      # Read-only view of ./backend so any model.h5 you train is picked up
+      # automatically (just restart the backend container).
+      - ./backend:/models:ro
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: gym-counter-frontend:latest
+    container_name: gym-counter-frontend
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+
+volumes:
+  gym-data:
