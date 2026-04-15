@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 
-LABELS = ["curl", "squat", "pushup", "rest"]
+LABELS = ["curl", "squat", "rest"]
 LABEL_TO_IDX = {name: i for i, name in enumerate(LABELS)}
 WINDOW = 50
 N_CLASSES = len(LABELS)

@@ -89,7 +89,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--label",
         required=True,
-        choices=["curl", "squat", "pushup", "rest"],
+        choices=["curl", "squat", "rest"],
         help="Label to attach to every window received during this run",
     )
     parser.add_argument(

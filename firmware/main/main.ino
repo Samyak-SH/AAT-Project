@@ -18,11 +18,10 @@
 #include <HTTPClient.h>
 
 // -------- USER CONFIG --------
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASS       "YOUR_WIFI_PASSWORD"
-#define SERVER_URL      "http://192.168.1.10:8000/api/ingest"
-#define AUTH_TOKEN      "REPLACE_WITH_JWT_TOKEN"
-#define DEVICE_ID       "gym-esp32-01"
+#define WIFI_SSID   "Ruchi ka Wifi"
+#define WIFI_PASS   "no.pass.123"
+#define SERVER_URL  "http://192.168.1.14:8000/api/ingest"
+#define DEVICE_ID   "rudy-wrist-01"
 // -----------------------------
 
 // ADXL345
@@ -141,7 +140,6 @@ void sendWindow() {
   HTTPClient http;
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
   String payload = buildPayload();
   int code = http.POST(payload);
   if (code > 0) {

@@ -25,8 +25,12 @@ For HTTPS add:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -38,14 +42,14 @@ import jwt
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-LABELS = ["curl", "squat", "pushup", "rest"]
+LABELS = ["curl", "squat", "rest"]
 IDX_REST = LABELS.index("rest")
 WINDOW = 50
 CONFIDENCE_FORM_THRESHOLD = 0.85
@@ -54,6 +58,9 @@ RATE_LIMIT_PER_MIN = 100
 BACKEND_DIR = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", BACKEND_DIR / "model.h5"))
 DB_PATH = Path(os.environ.get("DB_PATH", BACKEND_DIR / "sessions.db"))
+# Default collection output lives under /data (the named volume) so it survives
+# container restarts and is host-visible via `docker compose cp`.
+COLLECT_CSV = Path(os.environ.get("COLLECT_CSV", "/data/collected_dataset.csv"))
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
 JWT_ALG = "HS256"
@@ -64,6 +71,12 @@ DEMO_PASS = os.environ.get("DEMO_PASS", "admin")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
+# Local NLP via Ollama (https://ollama.com). When the backend runs in Docker,
+# `http://host.docker.internal:11434` reaches the Mac host's Ollama daemon.
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_TIMEOUT_S = float(os.environ.get("OLLAMA_TIMEOUT_S", "30"))
 
 # ---------------------------------------------------------------------------
 # Database
@@ -83,6 +96,11 @@ def db_init() -> None:
     with db_connect() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS users (
+              username      TEXT PRIMARY KEY,
+              password_hash TEXT NOT NULL,
+              created_at    REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS sessions (
               id         INTEGER PRIMARY KEY AUTOINCREMENT,
               user       TEXT    NOT NULL,
@@ -104,6 +122,58 @@ def db_init() -> None:
             """
         )
         conn.commit()
+
+    # Seed the demo user from env so the old creds keep working out-of-the-box.
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT username FROM users WHERE username = ?", (DEMO_USER,)
+        ).fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
+                (DEMO_USER, hash_password(DEMO_PASS), time.time()),
+            )
+            conn.commit()
+            print(f"[db] Seeded demo user '{DEMO_USER}'")
+
+
+# --------- Password hashing (PBKDF2-HMAC-SHA256, stdlib only) ---------
+
+_PBKDF2_ITERS = 200_000
+
+
+def hash_password(pw: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, _PBKDF2_ITERS)
+    return f"pbkdf2_sha256${_PBKDF2_ITERS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        scheme, iters_s, salt_hex, digest_hex = stored.split("$", 3)
+    except ValueError:
+        return False
+    if scheme != "pbkdf2_sha256":
+        return False
+    try:
+        iters = int(iters_s)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, iters)
+    return hmac.compare_digest(digest, expected)
+
+
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
+
+
+def valid_username(u: str) -> bool:
+    return bool(USERNAME_RE.match(u))
+
+
+def valid_password(p: str) -> bool:
+    return 6 <= len(p) <= 128
 
 
 # ---------------------------------------------------------------------------
@@ -141,22 +211,18 @@ class Classifier:
             probs = self.model.predict(window[np.newaxis, ...], verbose=0)[0]
             probs = np.asarray(probs, dtype=np.float32)
             return int(np.argmax(probs)), float(np.max(probs)), probs.tolist()
-        # ---------- Heuristic fallback ----------
-        # Pick the class whose synthetic signature the window most resembles.
+        # ---------- Heuristic fallback (3 classes: curl / squat / rest) ----------
         ax, ay, az = window[:, 0], window[:, 1], window[:, 2]
         energy = float(np.std(ax) + np.std(ay) + np.std(az))
         if energy < 0.08:
-            probs = [0.02, 0.02, 0.02, 0.94]
+            probs = [0.02, 0.02, 0.96]               # rest
         else:
-            # Dominant-axis fingerprint
             std_x, std_y, std_z = float(np.std(ax)), float(np.std(ay)), float(np.std(az))
             dom = int(np.argmax([std_x, std_y, std_z]))
-            if dom == 1:
-                probs = [0.75, 0.10, 0.10, 0.05]    # curl (y dominant)
-            elif dom == 2:
-                probs = [0.10, 0.70, 0.10, 0.10]    # squat (z dominant)
+            if dom == 2:
+                probs = [0.10, 0.80, 0.10]           # squat (z dominant)
             else:
-                probs = [0.10, 0.10, 0.75, 0.05]    # pushup (x dominant)
+                probs = [0.80, 0.10, 0.10]           # curl (x or y dominant)
         arr = np.asarray(probs, dtype=np.float32)
         return int(np.argmax(arr)), float(np.max(arr)), arr.tolist()
 
@@ -172,7 +238,7 @@ class RepCounter:
 
     A rep is counted whenever we observe the sequence:
         active (X) -> rest -> active (X)
-    where X is one of curl/squat/pushup. Each time the active exercise changes
+    where X is one of curl/squat. Each time the active exercise changes
     (e.g. curl -> squat) we open a new `set` row, so form score is per-set.
     """
 
@@ -320,6 +386,71 @@ class RepCounter:
 # ---------------------------------------------------------------------------
 
 
+class Collector:
+    """Appends labelled windows to a CSV. Toggle on/off at runtime."""
+
+    def __init__(self, csv_path: Path) -> None:
+        self.csv_path = csv_path
+        self._lock = threading.Lock()
+        self._label: Optional[str] = None
+        self._counts: Dict[str, int] = {}
+
+    def _ensure_header(self) -> None:
+        if self.csv_path.exists():
+            return
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        import csv as _csv
+        with self.csv_path.open("w", newline="") as f:
+            w = _csv.writer(f)
+            cols: List[str] = []
+            for prefix in ("ax", "ay", "az"):
+                cols.extend(f"{prefix}{i}" for i in range(WINDOW))
+            cols.append("label")
+            w.writerow(cols)
+
+    def start(self, label: str) -> Dict[str, Any]:
+        if label not in LABELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"label must be one of {LABELS}",
+            )
+        with self._lock:
+            self._ensure_header()
+            self._label = label
+            self._counts.setdefault(label, 0)
+        return {"status": "collecting", "label": label, "count": self._counts[label]}
+
+    def stop(self) -> Dict[str, Any]:
+        with self._lock:
+            was = self._label
+            self._label = None
+        return {"status": "stopped", "last_label": was, "counts": dict(self._counts)}
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "collecting": self._label is not None,
+                "label": self._label,
+                "counts": dict(self._counts),
+                "csv_path": str(self.csv_path),
+                "total": sum(self._counts.values()),
+            }
+
+    def maybe_append(self, ax: List[float], ay: List[float], az: List[float]) -> None:
+        with self._lock:
+            if not self._label:
+                return
+            label = self._label
+        # Release the lock before filesystem I/O; use a short follow-up lock
+        # only for bumping the counter.
+        import csv as _csv
+        with self.csv_path.open("a", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow([f"{v:.4f}" for v in (ax + ay + az)] + [label])
+        with self._lock:
+            self._counts[label] = self._counts.get(label, 0) + 1
+
+
 class PerDeviceRateLimiter:
     """Fixed window counter keyed by device id (max N per 60s)."""
 
@@ -355,7 +486,10 @@ def make_token(user: str) -> str:
 def require_auth(authorization: Optional[str] = Header(default=None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.split(None, 1)[1].strip()
+    parts = authorization.split(None, 1)
+    token = parts[1].strip() if len(parts) > 1 else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
     try:
         decoded = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.ExpiredSignatureError:
@@ -378,10 +512,16 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SignupRequest(BaseModel):
+    username: str
+    password: str
+
+
 class LoginResponse(BaseModel):
     token: str
     expires_in: int
     token_type: str = "bearer"
+    username: str
 
 
 class IngestRequest(BaseModel):
@@ -434,15 +574,17 @@ app.add_middleware(
 classifier: Classifier
 counter: RepCounter
 rate_limiter: PerDeviceRateLimiter
+collector: Collector
 
 
 @app.on_event("startup")
 def _startup() -> None:
-    global classifier, counter, rate_limiter
+    global classifier, counter, rate_limiter, collector
     db_init()
     classifier = Classifier(MODEL_PATH)
     counter = RepCounter()
     rate_limiter = PerDeviceRateLimiter(RATE_LIMIT_PER_MIN)
+    collector = Collector(COLLECT_CSV)
     print("[startup] ready")
 
 
@@ -467,9 +609,53 @@ def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:  # 
 
 @app.post("/api/auth/login", response_model=LoginResponse)
 def login(body: LoginRequest) -> LoginResponse:
-    if body.username != DEMO_USER or body.password != DEMO_PASS:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return LoginResponse(token=make_token(body.username), expires_in=JWT_TTL_SECONDS)
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT username, password_hash FROM users WHERE username = ?",
+            (body.username,),
+        ).fetchone()
+    if not row or not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return LoginResponse(
+        token=make_token(row["username"]),
+        expires_in=JWT_TTL_SECONDS,
+        username=row["username"],
+    )
+
+
+@app.post("/api/auth/signup", response_model=LoginResponse)
+def signup(body: SignupRequest) -> LoginResponse:
+    if not valid_username(body.username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3-32 chars: letters, digits, _ . -",
+        )
+    if not valid_password(body.password):
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be 6-128 characters",
+        )
+    with db_connect() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM users WHERE username = ?", (body.username,)
+        ).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already taken")
+        conn.execute(
+            "INSERT INTO users(username, password_hash, created_at) VALUES (?, ?, ?)",
+            (body.username, hash_password(body.password), time.time()),
+        )
+        conn.commit()
+    return LoginResponse(
+        token=make_token(body.username),
+        expires_in=JWT_TTL_SECONDS,
+        username=body.username,
+    )
+
+
+@app.get("/api/auth/me")
+def me(user: str = Depends(require_auth)) -> Dict[str, str]:
+    return {"username": user}
 
 
 # ---- Ingest ----
@@ -490,11 +676,16 @@ def _validate_window(r: IngestRequest) -> np.ndarray:
 
 
 @app.post("/api/ingest", response_model=IngestResponse)
-def ingest(body: IngestRequest, user: str = Depends(require_auth)) -> IngestResponse:
+def ingest(body: IngestRequest) -> IngestResponse:
+    # No auth on /api/ingest — devices on the LAN just POST. Rate limit
+    # (per device_id) still protects the endpoint from abuse.
     if not rate_limiter.check(body.device_id or "unknown"):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
     window = _validate_window(body)
+    # If data-collection is active, persist the window with its label.
+    collector.maybe_append(body.ax, body.ay, body.az)
+
     cls_idx, conf, probs = classifier.predict(window)
     exercise = LABELS[cls_idx]
     state = counter.update(exercise, conf)
@@ -579,6 +770,28 @@ def sessions_list(user: str = Depends(require_auth)) -> Dict[str, Any]:
     return {"sessions": [dict(r) for r in rows]}
 
 
+# ---- Data collection ----
+
+
+class CollectStartBody(BaseModel):
+    label: str
+
+
+@app.post("/api/collect/start")
+def collect_start(body: CollectStartBody, user: str = Depends(require_auth)) -> Dict[str, Any]:
+    return collector.start(body.label)
+
+
+@app.post("/api/collect/stop")
+def collect_stop(user: str = Depends(require_auth)) -> Dict[str, Any]:
+    return collector.stop()
+
+
+@app.get("/api/collect/status")
+def collect_status(user: str = Depends(require_auth)) -> Dict[str, Any]:
+    return collector.status()
+
+
 # ---- Live polling ----
 
 
@@ -594,25 +807,270 @@ def live(user: str = Depends(require_auth)) -> Dict[str, Any]:
 # ---- NLP query ----
 
 
-def _current_context() -> Dict[str, Any]:
-    """Build a compact session-data blob for Claude."""
+def _current_context(user: str) -> Dict[str, Any]:
+    """Session-data blob scoped to a user."""
     with db_connect() as conn:
         sessions = conn.execute(
             "SELECT id, user, started_at, ended_at FROM sessions "
-            "ORDER BY id DESC LIMIT 10"
+            "WHERE user = ? ORDER BY id DESC LIMIT 10",
+            (user,),
         ).fetchall()
+        sess_ids = [s["id"] for s in sessions] or [-1]
+        placeholders = ",".join("?" * len(sess_ids))
         sets = conn.execute(
-            "SELECT session_id, exercise, reps, form_score, started_at, ended_at "
-            "FROM sets WHERE session_id IN ("
-            "  SELECT id FROM sessions ORDER BY id DESC LIMIT 10"
-            ") ORDER BY session_id DESC, id ASC"
+            f"SELECT session_id, exercise, reps, form_score, started_at, ended_at "
+            f"FROM sets WHERE session_id IN ({placeholders}) "
+            f"ORDER BY session_id DESC, id ASC",
+            sess_ids,
         ).fetchall()
     return {
         "now": time.time(),
+        "user": user,
         "live": counter.snapshot(),
         "sessions": [dict(s) for s in sessions],
         "sets": [dict(s) for s in sets],
     }
+
+
+def _context_summary(ctx: Dict[str, Any]) -> str:
+    """Render the context as a compact natural-language brief.
+
+    Small LLMs (llama3.2:1b) choke on raw JSON and tend to echo fields.
+    A prose summary of the same facts lands much better.
+    """
+    lines: List[str] = []
+    user = ctx.get("user", "the user")
+    lines.append(f"User: {user}")
+
+    live = ctx.get("live") or {}
+    if live.get("session_id"):
+        lines.append(
+            f"Live status: currently in session {live['session_id']}, "
+            f"exercise={live.get('exercise')}, reps={live.get('reps', 0)}, "
+            f"form={round(float(live.get('form_score', 0)) * 100)}%."
+        )
+    else:
+        lines.append("Live status: no active session.")
+
+    sessions = ctx.get("sessions") or []
+    sets = ctx.get("sets") or []
+    if not sessions:
+        lines.append("History: no past workouts recorded yet.")
+        return "\n".join(lines)
+
+    # Today's date (UTC-ish, good enough for a coach summary).
+    now = ctx.get("now") or time.time()
+    day_start = now - 24 * 3600
+    today_sets = [s for s in sets if (s.get("started_at") or 0) >= day_start]
+
+    totals_all: Dict[str, int] = {}
+    totals_today: Dict[str, int] = {}
+    worst = ("none", 1.01)
+    best = ("none", -0.01)
+    for s in sets:
+        ex = s["exercise"]
+        reps = int(s["reps"])
+        fs = float(s["form_score"])
+        totals_all[ex] = totals_all.get(ex, 0) + reps
+        if fs < worst[1]:
+            worst = (ex, fs)
+        if fs > best[1]:
+            best = (ex, fs)
+    for s in today_sets:
+        totals_today[s["exercise"]] = totals_today.get(s["exercise"], 0) + int(s["reps"])
+
+    lines.append(f"Recent sessions: {len(sessions)} (most recent id={sessions[0]['id']}).")
+    if totals_today:
+        tt = ", ".join(f"{k}:{v}" for k, v in totals_today.items())
+        lines.append(f"Today's reps: {tt} (total={sum(totals_today.values())}).")
+    else:
+        lines.append("Today's reps: none yet.")
+    if totals_all:
+        ta = ", ".join(f"{k}:{v}" for k, v in totals_all.items())
+        lines.append(f"All-time (last 10 sessions): {ta}.")
+    if worst[0] != "none":
+        lines.append(f"Worst-form exercise: {worst[0]} at {round(worst[1]*100)}%.")
+    if best[0] != "none":
+        lines.append(f"Best-form exercise: {best[0]} at {round(best[1]*100)}%.")
+    # Include last 8 sets as a mini log
+    if sets:
+        log = []
+        for s in sets[:8]:
+            log.append(f"{s['exercise']}×{s['reps']} (form {round(float(s['form_score'])*100)}%)")
+        lines.append("Recent sets: " + "; ".join(log) + ".")
+
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = (
+    "You are a friendly, concise gym coach. Keep replies to 1-3 short "
+    "sentences. Use ONLY the facts you are given about the user's workout. "
+    "Never invent numbers. If the facts don't answer the question, say so "
+    "briefly and suggest what to track. Greet casually when the user says hi."
+)
+
+
+def _build_user_prompt(question: str, summary: str) -> str:
+    return (
+        f"Here are the current facts about the user's workout:\n"
+        f"---\n{summary}\n---\n\n"
+        f"User says: {question}"
+    )
+
+
+def _ollama_post(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"ollama {path} HTTP {e.code}: {e.read().decode('utf-8', 'ignore')}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"ollama unreachable at {OLLAMA_URL}{path}: {e}") from e
+
+
+def _ask_ollama(question: str, summary: str) -> str:
+    """Non-streaming Ollama call. Tries /api/chat, falls back to /api/generate."""
+    user_msg = _build_user_prompt(question, summary)
+    try:
+        payload = _ollama_post("/api/chat", {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "options": {"temperature": 0.3, "num_predict": 256},
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+        })
+        text = ((payload.get("message") or {}).get("content") or "").strip()
+        if text:
+            return text
+    except RuntimeError as e:
+        if "HTTP 404" not in str(e):
+            raise
+
+    payload = _ollama_post("/api/generate", {
+        "model": OLLAMA_MODEL,
+        "stream": False,
+        "options": {"temperature": 0.3, "num_predict": 256},
+        "system": SYSTEM_PROMPT,
+        "prompt": user_msg,
+    })
+    text = (payload.get("response") or "").strip()
+    if not text:
+        raise RuntimeError(f"ollama returned empty response: {payload}")
+    return text
+
+
+def _stream_ollama(question: str, summary: str):
+    """Yield text chunks from Ollama. Tries /api/chat first, falls back to /api/generate."""
+    import urllib.request
+    import urllib.error
+
+    user_msg = _build_user_prompt(question, summary)
+
+    def open_stream(path: str, body: Dict[str, Any]):
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        return urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT_S)
+
+    # Try /api/chat
+    try:
+        resp = open_stream("/api/chat", {
+            "model": OLLAMA_MODEL,
+            "stream": True,
+            "options": {"temperature": 0.3, "num_predict": 256},
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+        })
+        saw_any = False
+        for raw in resp:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            chunk = (obj.get("message") or {}).get("content") or ""
+            if chunk:
+                saw_any = True
+                yield chunk
+            if obj.get("done"):
+                break
+        if saw_any:
+            return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise RuntimeError(f"ollama /api/chat HTTP {e.code}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"ollama unreachable: {e}") from e
+
+    # Fallback: /api/generate
+    try:
+        resp = open_stream("/api/generate", {
+            "model": OLLAMA_MODEL,
+            "stream": True,
+            "options": {"temperature": 0.3, "num_predict": 256},
+            "system": SYSTEM_PROMPT,
+            "prompt": user_msg,
+        })
+        for raw in resp:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            chunk = obj.get("response") or ""
+            if chunk:
+                yield chunk
+            if obj.get("done"):
+                break
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"ollama /api/generate HTTP {e.code}: {body}") from e
+
+
+def _ask_anthropic(question: str, summary: str) -> str:
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=512,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": _build_user_prompt(question, summary)}],
+    )
+    text = "".join(
+        block.text for block in msg.content
+        if getattr(block, "type", None) == "text"
+    ).strip()
+    if not text:
+        raise RuntimeError("anthropic returned empty response")
+    return text
+
+
+def _stream_anthropic(question: str, summary: str):
+    import anthropic
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    with client.messages.stream(
+        model=ANTHROPIC_MODEL,
+        max_tokens=512,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": _build_user_prompt(question, summary)}],
+    ) as s:
+        for text in s.text_stream:
+            if text:
+                yield text
 
 
 @app.post("/api/query", response_model=QueryResponse)
@@ -621,43 +1079,89 @@ def query(body: QueryRequest, user: str = Depends(require_auth)) -> QueryRespons
     if not question:
         raise HTTPException(status_code=400, detail="question must not be empty")
 
-    ctx = _current_context()
-    ctx_json = json.dumps(ctx, default=str)
+    ctx = _current_context(user)
+    summary = _context_summary(ctx)
 
-    if not ANTHROPIC_API_KEY:
-        # Deterministic local answer when no API key is configured
-        return QueryResponse(answer=_local_answer(question, ctx))
+    errors: List[str] = []
+    if OLLAMA_URL:
+        try:
+            return QueryResponse(answer=_ask_ollama(question, summary))
+        except Exception as e:
+            errors.append(str(e))
+    if ANTHROPIC_API_KEY:
+        try:
+            return QueryResponse(answer=_ask_anthropic(question, summary))
+        except Exception as e:
+            errors.append(str(e))
 
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        msg = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=512,
-            system=(
-                "You are a concise gym coach assistant. Answer the user's question "
-                "using ONLY the JSON session data provided. If the data is insufficient, "
-                "say so briefly. Keep answers short."
-            ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        f"Session data (JSON):\n{ctx_json}\n\n"
-                        f"Question: {question}"
-                    ),
-                }
-            ],
-        )
-        text = "".join(
-            block.text for block in msg.content
-            if getattr(block, "type", None) == "text"
-        ).strip()
-        if not text:
-            text = _local_answer(question, ctx)
-        return QueryResponse(answer=text)
-    except Exception as exc:
-        return QueryResponse(answer=f"(fallback) {_local_answer(question, ctx)}  [anthropic error: {exc}]")
+    ans = _local_answer(question, ctx)
+    if errors:
+        ans = f"{ans}  [nlp fallback — errors: {' | '.join(errors)}]"
+    return QueryResponse(answer=ans)
+
+
+@app.post("/api/query/stream")
+def query_stream(body: QueryRequest, user: str = Depends(require_auth)) -> StreamingResponse:
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question must not be empty")
+
+    ctx = _current_context(user)
+    summary = _context_summary(ctx)
+
+    def event(kind: str, **extra: Any) -> bytes:
+        return (json.dumps({"type": kind, **extra}) + "\n").encode("utf-8")
+
+    def generate():
+        provider = None
+        errors: List[str] = []
+        stream = None
+
+        if OLLAMA_URL:
+            try:
+                stream = _stream_ollama(question, summary)
+                provider = f"ollama:{OLLAMA_MODEL}"
+            except Exception as e:
+                errors.append(f"ollama: {e}")
+                stream = None
+
+        if stream is None and ANTHROPIC_API_KEY:
+            try:
+                stream = _stream_anthropic(question, summary)
+                provider = f"anthropic:{ANTHROPIC_MODEL}"
+            except Exception as e:
+                errors.append(f"anthropic: {e}")
+                stream = None
+
+        if stream is None:
+            ans = _local_answer(question, ctx)
+            if errors:
+                ans = f"{ans}  [nlp fallback — errors: {' | '.join(errors)}]"
+            yield event("start", provider="local-rule-based")
+            yield event("token", content=ans)
+            yield event("done")
+            return
+
+        yield event("start", provider=provider)
+        try:
+            got_any = False
+            for chunk in stream:
+                if chunk:
+                    got_any = True
+                    yield event("token", content=chunk)
+            if not got_any:
+                yield event("token", content=_local_answer(question, ctx))
+            yield event("done")
+        except Exception as e:
+            yield event("error", message=str(e))
+            yield event("token", content=_local_answer(question, ctx))
+            yield event("done")
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def _local_answer(question: str, ctx: Dict[str, Any]) -> str:
@@ -674,8 +1178,6 @@ def _local_answer(question: str, ctx: Dict[str, Any]) -> str:
         return f"You've done {totals.get('curl', 0)} curls across recent sessions."
     if "squat" in q:
         return f"You've done {totals.get('squat', 0)} squats across recent sessions."
-    if "pushup" in q or "push-up" in q or "push up" in q:
-        return f"You've done {totals.get('pushup', 0)} pushups across recent sessions."
     if "worst" in q and "form" in q:
         return (
             f"Worst form so far: {worst[0]} (score {worst[1]:.2f})."

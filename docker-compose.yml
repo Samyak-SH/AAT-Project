@@ -11,9 +11,15 @@ services:
       DEMO_USER: ${DEMO_USER:-admin}
       DEMO_PASS: ${DEMO_PASS:-admin}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Point at a local Ollama daemon. On Mac/Windows the container reaches
+      # the host at host.docker.internal. Empty string disables Ollama.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:1b}
       # Backend falls back to a heuristic classifier if model.h5 isn't present.
       MODEL_PATH: /models/model.h5
       DB_PATH: /data/sessions.db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Persist SQLite between runs
       - gym-data:/data

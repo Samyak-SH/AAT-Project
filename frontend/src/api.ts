@@ -120,16 +120,14 @@ const mock: MockStore = {
       user: "demo",
       started_at: Date.now() / 1000 - 3600,
       ended_at: Date.now() / 1000 - 3400,
-      total_reps: 32,
-      reps_per_exercise: { curl: 12, squat: 10, pushup: 10 },
-      form_per_exercise: { curl: 0.92, squat: 0.81, pushup: 0.74 },
+      total_reps: 22,
+      reps_per_exercise: { curl: 12, squat: 10 },
+      form_per_exercise: { curl: 0.92, squat: 0.81 },
       sets: [
         { id: 1, session_id: 1, exercise: "curl", reps: 12, form_score: 0.92,
           started_at: Date.now() / 1000 - 3600, ended_at: Date.now() / 1000 - 3540 },
         { id: 2, session_id: 1, exercise: "squat", reps: 10, form_score: 0.81,
           started_at: Date.now() / 1000 - 3540, ended_at: Date.now() / 1000 - 3480 },
-        { id: 3, session_id: 1, exercise: "pushup", reps: 10, form_score: 0.74,
-          started_at: Date.now() / 1000 - 3480, ended_at: Date.now() / 1000 - 3400 },
       ],
     },
   ],
@@ -140,7 +138,7 @@ const mock: MockStore = {
 
 function mockAdvance() {
   // Rotate exercises and increment reps so the dashboard moves in mock mode.
-  const cycle = ["curl", "curl", "rest", "squat", "squat", "rest", "pushup", "pushup", "rest"];
+  const cycle = ["curl", "curl", "rest", "squat", "squat", "rest"];
   const t = Math.floor(Date.now() / 1000) % cycle.length;
   const ex = cycle[t];
   const conf = ex === "rest" ? 0.55 + 0.1 * Math.sin(Date.now() / 500)
@@ -173,16 +171,53 @@ export function setMode(m: Mode) {
   } catch { /* ignore */ }
 })();
 
-export async function login(username: string, password: string): Promise<void> {
+export function getUsername(): string | null {
+  try { return localStorage.getItem("username"); } catch { return null; }
+}
+function setUsername(u: string | null) {
+  try {
+    if (u) localStorage.setItem("username", u);
+    else localStorage.removeItem("username");
+  } catch { /* ignore */ }
+}
+
+export function isAuthenticated(): boolean {
+  try { return !!localStorage.getItem("jwt"); } catch { return false; }
+}
+
+export function logout() {
+  setToken(null);
+  setUsername(null);
+}
+
+export async function login(username: string, password: string): Promise<string> {
   if (mode === "mock") {
     setToken("mock-token");
-    return;
+    setUsername(username || "demo");
+    return username || "demo";
   }
-  const r = await rawFetch<{ token: string }>("/api/auth/login", {
+  const r = await rawFetch<{ token: string; username: string }>("/api/auth/login", {
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
   setToken(r.token);
+  setUsername(r.username);
+  return r.username;
+}
+
+export async function signup(username: string, password: string): Promise<string> {
+  if (mode === "mock") {
+    setToken("mock-token");
+    setUsername(username);
+    return username;
+  }
+  const r = await rawFetch<{ token: string; username: string }>("/api/auth/signup", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+  setToken(r.token);
+  setUsername(r.username);
+  return r.username;
 }
 
 export async function fetchLive(): Promise<LiveState> {
@@ -242,6 +277,73 @@ export async function fetchSessions(): Promise<SessionListEntry[]> {
   return r.sessions;
 }
 
+// Stream tokens from /api/query/stream. Yields string chunks as they arrive.
+// In mock mode simulates streaming by splitting a fake answer into words.
+export async function* askQueryStream(
+  question: string,
+  signal?: AbortSignal,
+): AsyncGenerator<string, void, void> {
+  if (mode === "mock") {
+    const answer = await askQuery(question);
+    const tokens = answer.split(/(\s+)/);
+    for (const t of tokens) {
+      if (signal?.aborted) return;
+      await new Promise((r) => setTimeout(r, 35));
+      yield t;
+    }
+    return;
+  }
+
+  const token = getTokenPublic();
+  const resp = await fetch(getBase() + "/api/query/stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ question }),
+    signal,
+  });
+  if (!resp.ok || !resp.body) {
+    let detail = `HTTP ${resp.status}`;
+    try { detail += `: ${(await resp.json()).error || ""}`; } catch { /* ignore */ }
+    throw new Error(detail);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx: number;
+      // Each ndjson line is one event
+      // eslint-disable-next-line no-cond-assign
+      while ((idx = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.type === "token" && typeof obj.content === "string") {
+            yield obj.content;
+          } else if (obj.type === "error") {
+            yield `\n[error: ${obj.message}]`;
+          }
+        } catch { /* skip malformed */ }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+}
+
+function getTokenPublic(): string | null {
+  try { return localStorage.getItem("jwt"); } catch { return null; }
+}
+
 export async function askQuery(question: string): Promise<string> {
   if (mode === "mock") {
     const q = question.toLowerCase();
@@ -253,7 +355,6 @@ export async function askQuery(question: string): Promise<string> {
     }
     if (q.includes("curl")) return `You've done ${totals.curl || 0} curls (mock).`;
     if (q.includes("squat")) return `You've done ${totals.squat || 0} squats (mock).`;
-    if (q.includes("pushup") || q.includes("push")) return `You've done ${totals.pushup || 0} pushups (mock).`;
     if (q.includes("worst") && q.includes("form")) {
       let worst: [string, number] = ["none", 1];
       for (const s of mock.sessions) {

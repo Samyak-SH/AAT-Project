@@ -46,7 +46,7 @@ default heuristic (used when no Keras model is loaded) assumes that mounting.
 ## Repo layout
 
 ```
-.
+gym-counter/
 ├── firmware/main.ino              ESP32 Arduino sketch (50Hz, sliding window)
 ├── ml/
 │   ├── collect_data.py            Label + save windows to CSV
@@ -71,6 +71,7 @@ default heuristic (used when no Keras model is loaded) assumes that mounting.
 ## Quick start (Docker — everything in one command)
 
 ```bash
+cd gym-counter
 cp .env.example .env        # then edit secrets as needed
 docker compose up --build   # or: make up
 ```

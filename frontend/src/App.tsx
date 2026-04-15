@@ -1,29 +1,28 @@
 import { useEffect, useState } from "react";
 import LiveCounter from "./components/LiveCounter";
 import SessionHistory from "./components/SessionHistory";
-import QueryBox from "./components/QueryBox";
+import FloatingChat from "./components/FloatingChat";
+import AuthPage from "./components/AuthPage";
 import {
   getBasePublic,
   getMode,
+  getUsername,
   health,
-  login,
-  setBase,
+  isAuthenticated,
+  logout,
   setMode,
-  setToken,
   type Mode,
 } from "./api";
 
 type Tab = "live" | "history";
 
 export default function App() {
+  const [authed, setAuthed] = useState<boolean>(isAuthenticated());
+  const [username, setUsername] = useState<string | null>(getUsername());
   const [tab, setTab] = useState<Tab>("live");
   const [mode, setModeState] = useState<Mode>(getMode());
-  const [base, setBaseState] = useState<string>(getBasePublic());
   const [online, setOnline] = useState<boolean | null>(null);
-  const [authOpen, setAuthOpen] = useState(false);
-  const [authMsg, setAuthMsg] = useState<string | null>(null);
-  const [user, setUser] = useState("admin");
-  const [pass, setPass] = useState("admin");
+  const [menuOpen, setMenuOpen] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -37,27 +36,31 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  if (!authed) {
+    return (
+      <AuthPage
+        onAuthenticated={(u) => {
+          setUsername(u);
+          setAuthed(true);
+        }}
+      />
+    );
+  }
+
   const toggleMode = () => {
     const next: Mode = mode === "live" ? "mock" : "live";
     setMode(next);
     setModeState(next);
   };
 
-  const doLogin = async () => {
-    setAuthMsg(null);
-    try {
-      await login(user, pass);
-      setAuthMsg("Logged in.");
-      setAuthOpen(false);
-    } catch (e) {
-      setAuthMsg(e instanceof Error ? e.message : String(e));
-    }
+  const doLogout = () => {
+    logout();
+    setAuthed(false);
+    setUsername(null);
+    setMenuOpen(false);
   };
 
-  const doLogout = () => {
-    setToken(null);
-    setAuthMsg("Logged out.");
-  };
+  const base = getBasePublic();
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-ink-900 via-ink-900 to-ink-800">
@@ -71,7 +74,7 @@ export default function App() {
               <div className="font-semibold">Gym Rep Counter</div>
               <div className="text-xs text-gray-400">
                 Mode: <span className="text-emerald-300">{mode}</span>
-                {" · "}API: <span className="text-gray-300">{base}</span>
+                {" · "}API: <span className="text-gray-300">{base || "same-origin"}</span>
                 {" · "}
                 {online == null ? "checking…" : online ? (
                   <span className="text-emerald-400">online</span>
@@ -81,6 +84,7 @@ export default function App() {
               </div>
             </div>
           </div>
+
           <div className="flex items-center gap-2">
             <nav className="bg-ink-800 rounded-xl p-1 text-sm">
               <TabBtn active={tab === "live"} onClick={() => setTab("live")}>Live</TabBtn>
@@ -88,72 +92,60 @@ export default function App() {
             </nav>
             <button
               onClick={toggleMode}
-              className="text-xs rounded-xl px-3 py-2 bg-ink-800 hover:bg-ink-700 border border-ink-700"
+              className="hidden md:inline-flex text-xs rounded-xl px-3 py-2 bg-ink-800 hover:bg-ink-700 border border-ink-700"
               title="Toggle between live backend and mock data"
             >
-              {mode === "live" ? "Switch to mock" : "Switch to live"}
+              {mode === "live" ? "Mock" : "Live"}
             </button>
-            <button
-              onClick={() => setAuthOpen((v) => !v)}
-              className="text-xs rounded-xl px-3 py-2 bg-ink-800 hover:bg-ink-700 border border-ink-700"
-            >
-              Login
-            </button>
-          </div>
-        </div>
 
-        {authOpen && (
-          <div className="max-w-6xl mx-auto px-6 pb-4">
-            <div className="rounded-xl bg-ink-800 border border-ink-700 p-4 flex flex-col md:flex-row gap-3 md:items-end">
-              <Field label="API base">
-                <input
-                  className="bg-ink-700 rounded-lg px-3 py-2 text-sm w-72"
-                  value={base}
-                  onChange={(e) => setBaseState(e.target.value)}
-                  onBlur={() => setBase(base)}
-                />
-              </Field>
-              <Field label="Username">
-                <input
-                  className="bg-ink-700 rounded-lg px-3 py-2 text-sm"
-                  value={user}
-                  onChange={(e) => setUser(e.target.value)}
-                />
-              </Field>
-              <Field label="Password">
-                <input
-                  type="password"
-                  className="bg-ink-700 rounded-lg px-3 py-2 text-sm"
-                  value={pass}
-                  onChange={(e) => setPass(e.target.value)}
-                />
-              </Field>
+            <div className="relative">
               <button
-                onClick={doLogin}
-                className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-ink-900 font-semibold px-4 py-2 text-sm"
+                onClick={() => setMenuOpen((v) => !v)}
+                className="flex items-center gap-2 rounded-xl pl-2 pr-3 py-1.5 bg-ink-800 hover:bg-ink-700 border border-ink-700 text-sm"
               >
-                Log in
+                <span className="w-7 h-7 rounded-full bg-emerald-500 text-ink-900 grid place-content-center font-bold text-xs">
+                  {(username || "?").slice(0, 1).toUpperCase()}
+                </span>
+                <span className="hidden sm:inline">{username}</span>
+                <span className="text-gray-500">▾</span>
               </button>
-              <button
-                onClick={doLogout}
-                className="rounded-lg bg-ink-700 hover:bg-ink-600 text-gray-200 px-4 py-2 text-sm"
-              >
-                Log out
-              </button>
-              {authMsg && <div className="text-xs text-gray-300">{authMsg}</div>}
+              {menuOpen && (
+                <div
+                  className="absolute right-0 mt-2 w-48 rounded-xl bg-ink-800 border border-ink-700 shadow-xl overflow-hidden z-20"
+                  onMouseLeave={() => setMenuOpen(false)}
+                >
+                  <div className="px-3 py-2 text-xs text-gray-400 border-b border-ink-700">
+                    Signed in as<br />
+                    <span className="text-gray-100 font-semibold">{username}</span>
+                  </div>
+                  <button
+                    onClick={toggleMode}
+                    className="md:hidden w-full text-left px-3 py-2 text-sm hover:bg-ink-700"
+                  >
+                    Switch to {mode === "live" ? "mock" : "live"}
+                  </button>
+                  <button
+                    onClick={doLogout}
+                    className="w-full text-left px-3 py-2 text-sm hover:bg-ink-700 text-red-300"
+                  >
+                    Log out
+                  </button>
+                </div>
+              )}
             </div>
           </div>
-        )}
+        </div>
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-6 grid grid-cols-1 gap-6">
         {tab === "live" ? <LiveCounter /> : <SessionHistory />}
-        <QueryBox />
       </main>
 
       <footer className="max-w-6xl mx-auto px-6 py-6 text-xs text-gray-500">
         ESP32 + ADXL345 · FastAPI + TF · React + Tailwind
       </footer>
+
+      <FloatingChat />
     </div>
   );
 }
@@ -169,14 +161,5 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
     >
       {children}
     </button>
-  );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span className="text-xs text-gray-400">{label}</span>
-      {children}
-    </label>
   );
 }
