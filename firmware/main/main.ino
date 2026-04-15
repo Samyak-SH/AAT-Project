@@ -20,7 +20,7 @@
 // -------- USER CONFIG --------
 #define WIFI_SSID   "Ruchi ka Wifi"
 #define WIFI_PASS   "no.pass.123"
-#define SERVER_URL  "http://192.168.1.14:8000/api/ingest"
+#define SERVER_URL  "http://192.168.1.14:8001/api/ingest"
 #define DEVICE_ID   "rudy-wrist-01"
 // -----------------------------
 
