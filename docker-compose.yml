@@ -27,7 +27,7 @@ services:
       # automatically (just restart the backend container).
       - ./backend:/models:ro
     ports:
-      - "8000:8000"
+      - "8001:8000"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
