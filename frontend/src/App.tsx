@@ -71,7 +71,7 @@ export default function App() {
               G
             </div>
             <div>
-              <div className="font-semibold">Gym Rep Counter</div>
+              <div className="font-semibold">GymTally</div>
               <div className="text-xs text-gray-400">
                 Mode: <span className="text-emerald-300">{mode}</span>
                 {" · "}API: <span className="text-gray-300">{base || "same-origin"}</span>
@@ -142,7 +142,7 @@ export default function App() {
       </main>
 
       <footer className="max-w-6xl mx-auto px-6 py-6 text-xs text-gray-500">
-        ESP32 + ADXL345 · FastAPI + TF · React + Tailwind
+        GymTally · ESP32 + ADXL345 · FastAPI · React
       </footer>
 
       <FloatingChat />

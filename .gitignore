@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+ml_env/
 venv/
 *.egg-info/
 
@@ -25,3 +26,10 @@ sessions.db
 .env
 .env.*
 !.env.example
+
+# Firmware secrets (WiFi/backend URL) — create from secrets.example.h
+firmware/main/secrets.h
+
+# Collected data
+ml/collected_dataset.csv
+backend/model.h5.old-bad

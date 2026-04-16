@@ -74,7 +74,7 @@ export default function AuthPage({ onAuthenticated }: Props) {
             <div className="w-10 h-10 rounded-xl bg-emerald-500 grid place-content-center text-ink-900 font-black text-lg">
               G
             </div>
-            <div className="text-lg font-semibold tracking-tight">Gym Rep Counter</div>
+            <div className="text-lg font-semibold tracking-tight">GymTally</div>
           </div>
 
           <div>
@@ -96,7 +96,7 @@ export default function AuthPage({ onAuthenticated }: Props) {
           </div>
 
           <div className="text-xs text-gray-500">
-            ESP32 + ADXL345 · FastAPI · React · Tailwind
+            GymTally · ESP32 + ADXL345 · FastAPI · React
           </div>
         </div>
 
@@ -107,7 +107,7 @@ export default function AuthPage({ onAuthenticated }: Props) {
               <div className="w-10 h-10 rounded-xl bg-emerald-500 grid place-content-center text-ink-900 font-black text-lg">
                 G
               </div>
-              <div className="text-lg font-semibold">Gym Rep Counter</div>
+              <div className="text-lg font-semibold">GymTally</div>
             </div>
 
             <div className="rounded-2xl bg-ink-800/80 backdrop-blur border border-ink-700 shadow-2xl p-7">

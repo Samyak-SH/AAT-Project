@@ -49,11 +49,23 @@ from pydantic import BaseModel, Field
 # Configuration
 # ---------------------------------------------------------------------------
 
-LABELS = ["curl", "squat", "rest"]
+LABELS = ["curl", "squat", "rest", "other"]
 IDX_REST = LABELS.index("rest")
 WINDOW = 50
 CONFIDENCE_FORM_THRESHOLD = 0.85
-RATE_LIMIT_PER_MIN = 100
+RATE_LIMIT_PER_MIN = 120   # raised: firmware now sends every 0.5 s (2×/s)
+
+# Rep counting tuning
+# VALLEY_CONF  — if the model still predicts the exercise but with confidence
+#                below this, we treat it as the "valley" between reps (arm at
+#                the bottom / top of the movement).  Combined with the explicit
+#                rest/other class this lets the counter work even when the brief
+#                pause between reps is < 1 window (500 ms).
+# ACTIVE_CONF  — confidence must rise back above this to credit a new rep.
+# MIN_REP_S    — minimum seconds between two counted reps (~75 reps/min max).
+VALLEY_CONF = 0.60
+ACTIVE_CONF = 0.70
+MIN_REP_S   = 0.8
 
 BACKEND_DIR = Path(__file__).resolve().parent
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", BACKEND_DIR / "model.h5"))
@@ -205,24 +217,32 @@ class Classifier:
             self.model = None
             self.mock = True
 
+    @staticmethod
+    def _normalise(window: np.ndarray) -> np.ndarray:
+        """Per-window, per-channel z-score — mirrors the training-time normalise()."""
+        mu = window.mean(axis=0, keepdims=True)      # (1, 3)
+        sd = window.std(axis=0, keepdims=True) + 1e-8
+        return (window - mu) / sd
+
     def predict(self, window: np.ndarray) -> Tuple[int, float, List[float]]:
         """window shape: (50, 3).  Returns (class_idx, confidence, all_probs)."""
         if self.model is not None:
-            probs = self.model.predict(window[np.newaxis, ...], verbose=0)[0]
+            norm_window = self._normalise(window)
+            probs = self.model.predict(norm_window[np.newaxis, ...], verbose=0)[0]
             probs = np.asarray(probs, dtype=np.float32)
             return int(np.argmax(probs)), float(np.max(probs)), probs.tolist()
-        # ---------- Heuristic fallback (3 classes: curl / squat / rest) ----------
+        # ---------- Heuristic fallback (4 classes: curl / squat / rest / other) ----------
         ax, ay, az = window[:, 0], window[:, 1], window[:, 2]
         energy = float(np.std(ax) + np.std(ay) + np.std(az))
         if energy < 0.08:
-            probs = [0.02, 0.02, 0.96]               # rest
+            probs = [0.02, 0.02, 0.94, 0.02]         # rest
         else:
             std_x, std_y, std_z = float(np.std(ax)), float(np.std(ay)), float(np.std(az))
             dom = int(np.argmax([std_x, std_y, std_z]))
             if dom == 2:
-                probs = [0.10, 0.80, 0.10]           # squat (z dominant)
+                probs = [0.08, 0.76, 0.08, 0.08]     # squat (z dominant)
             else:
-                probs = [0.80, 0.10, 0.10]           # curl (x or y dominant)
+                probs = [0.76, 0.08, 0.08, 0.08]     # curl (x or y dominant)
         arr = np.asarray(probs, dtype=np.float32)
         return int(np.argmax(arr)), float(np.max(arr)), arr.tolist()
 
@@ -242,16 +262,29 @@ class RepCounter:
     (e.g. curl -> squat) we open a new `set` row, so form score is per-set.
     """
 
+    # How many consecutive windows of a DIFFERENT exercise we must see before
+    # switching the active set. Prevents a single noisy "squat" blip mid-curl
+    # from resetting the rep count.
+    SWITCH_THRESHOLD = 3
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.session_id: Optional[int] = None
         self.current_exercise: Optional[str] = None
         self.last_active_exercise: Optional[str] = None
+        # Smoothing: track consecutive predictions of a candidate new exercise
+        self._pending_exercise: Optional[str] = None
+        self._pending_count: int = 0
         self.state: str = "rest"            # "rest" or "active"
         self.reps: int = 0                  # reps for the current set
         self.hi_conf: int = 0
         self.total: int = 0
         self.set_id: Optional[int] = None
+        # Valley detection: True while we are in the "bottom" of a rep
+        # (either the model classified rest/other, or confidence dipped below
+        # VALLEY_CONF while still predicting the exercise).
+        self.in_valley: bool = False
+        self.last_rep_time: float = 0.0     # wall-clock time of last counted rep
         self.last_prediction: Dict[str, Any] = {
             "exercise": "rest",
             "confidence": 0.0,
@@ -301,6 +334,10 @@ class RepCounter:
         self.hi_conf = 0
         self.total = 0
         self.set_id = None
+        self.in_valley = False
+        self.last_rep_time = 0.0
+        self._pending_exercise = None
+        self._pending_count = 0
 
     def _open_set_locked(self, conn: sqlite3.Connection, exercise: str) -> None:
         cur = conn.execute(
@@ -332,13 +369,33 @@ class RepCounter:
             now = time.time()
             if self.session_id is not None:
                 with db_connect() as conn:
-                    # Switch set if the active exercise changed
-                    if exercise != "rest":
-                        if self.current_exercise is None or (
-                            self.current_exercise != exercise
-                        ):
-                            self._close_set_locked(conn)
+                    # Switch set if the active exercise changed — but only
+                    # after SWITCH_THRESHOLD consecutive windows of the new
+                    # exercise. Prevents a single noisy "squat" blip mid-curl
+                    # from resetting the rep count.
+                    if exercise not in ("rest", "other"):
+                        if self.current_exercise is None:
+                            # First active prediction — open set immediately
                             self._open_set_locked(conn, exercise)
+                            self._pending_exercise = None
+                            self._pending_count = 0
+                        elif self.current_exercise != exercise:
+                            # Different exercise — accumulate toward switch
+                            if self._pending_exercise == exercise:
+                                self._pending_count += 1
+                            else:
+                                self._pending_exercise = exercise
+                                self._pending_count = 1
+                            # Only switch after N consecutive windows agree
+                            if self._pending_count >= self.SWITCH_THRESHOLD:
+                                self._close_set_locked(conn)
+                                self._open_set_locked(conn, exercise)
+                                self._pending_exercise = None
+                                self._pending_count = 0
+                        else:
+                            # Same exercise as current — reset any pending switch
+                            self._pending_exercise = None
+                            self._pending_count = 0
 
                     # Track form score counters for the current set
                     if self.set_id is not None:
@@ -346,13 +403,41 @@ class RepCounter:
                         if confidence >= CONFIDENCE_FORM_THRESHOLD:
                             self.hi_conf += 1
 
-                    # Rep state machine: active -> rest -> active-of-same
-                    if exercise == "rest":
+                    # ── Rep state machine ──────────────────────────────────
+                    # A rep is the sequence:  peak → valley → peak (same ex.)
+                    #
+                    # "valley" is entered when:
+                    #   a) the model predicts rest/other  (arm fully at rest), OR
+                    #   b) the model still predicts the exercise but with low
+                    #      confidence (< VALLEY_CONF) — catches the brief pause
+                    #      at the bottom/top of a fast rep that is shorter than
+                    #      one 1-second window.
+                    #
+                    # A rep is counted when confidence rises back above
+                    # ACTIVE_CONF for the same exercise, provided the refractory
+                    # period (MIN_REP_S) has elapsed since the last counted rep.
+                    # This prevents double-counting on overlapping windows.
+                    if exercise in ("rest", "other"):
+                        # Explicit rest / unrecognised motion → enter valley
                         if self.state == "active":
                             self.state = "rest"
+                        self.in_valley = True
+                    elif confidence < VALLEY_CONF:
+                        # Confidence dip while still predicting the exercise
+                        # (transition point between reps)
+                        if self.state == "active":
+                            self.state = "rest"
+                        self.in_valley = True
                     else:
-                        if self.state == "rest" and self.last_active_exercise == exercise:
+                        # Confidence is high — we are in the active part of a rep
+                        if (
+                            self.in_valley
+                            and self.last_active_exercise == exercise
+                            and (now - self.last_rep_time) >= MIN_REP_S
+                        ):
                             self.reps += 1
+                            self.last_rep_time = now
+                        self.in_valley = False
                         self.state = "active"
                         self.last_active_exercise = exercise
 
@@ -366,7 +451,26 @@ class RepCounter:
                         conn.commit()
 
             form_score = (self.hi_conf / self.total) if self.total else 0.0
+            # When the model predicts "other" (unknown motion), keep showing the
+            # previously-known exercise in the live snapshot. Reps / form still
+            # update, but the UI doesn't flicker to "other".
+            if exercise == "other" and self.last_prediction.get("exercise") not in (None, "other"):
+                display_exercise = self.last_prediction["exercise"]
+                display_confidence = self.last_prediction["confidence"]
+            else:
+                display_exercise = exercise
+                display_confidence = confidence
             self.last_prediction = {
+                "exercise": display_exercise,
+                "confidence": display_confidence,
+                "reps": self.reps,
+                "form_score": form_score,
+                "session_id": self.session_id,
+                "updated_at": now,
+            }
+            # The response to /api/ingest still reports the raw prediction
+            # so the ESP32 Serial Monitor shows what the model actually saw.
+            return {
                 "exercise": exercise,
                 "confidence": confidence,
                 "reps": self.reps,
@@ -374,7 +478,6 @@ class RepCounter:
                 "session_id": self.session_id,
                 "updated_at": now,
             }
-            return dict(self.last_prediction)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -693,7 +796,7 @@ def ingest(body: IngestRequest) -> IngestResponse:
     return IngestResponse(
         exercise=exercise,
         confidence=round(conf, 4),
-        probabilities={LABELS[i]: round(float(probs[i]), 4) for i in range(len(LABELS))},
+        probabilities={LABELS[i]: round(float(probs[i]), 4) for i in range(min(len(LABELS), len(probs)))},
         reps=state["reps"],
         form_score=round(state["form_score"], 4),
         session_id=state["session_id"],

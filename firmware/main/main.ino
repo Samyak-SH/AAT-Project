@@ -17,12 +17,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// -------- USER CONFIG --------
-#define WIFI_SSID   "Ruchi ka Wifi"
-#define WIFI_PASS   "no.pass.123"
-#define SERVER_URL  "http://192.168.1.14:8000/api/ingest"
-#define DEVICE_ID   "rudy-wrist-01"
-// -----------------------------
+// Credentials live in secrets.h (gitignored). Copy secrets.example.h ->
+// secrets.h, fill in WIFI_SSID / WIFI_PASS / SERVER_URL / DEVICE_ID.
+#include "secrets.h"
 
 // ADXL345
 static const uint8_t ADXL345_ADDR       = 0x53;
@@ -35,7 +32,7 @@ static const int SDA_PIN = 21;
 static const int SCL_PIN = 22;
 
 static const int WINDOW_SIZE  = 50;   // 1s at 50Hz
-static const int WINDOW_STRIDE= 25;   // 0.5s stride
+static const int WINDOW_STRIDE= 25;   // 0.5s stride → two predictions per second (50% overlap)
 static const int SAMPLE_HZ    = 50;
 static const unsigned long SAMPLE_PERIOD_MS = 1000UL / SAMPLE_HZ;
 
